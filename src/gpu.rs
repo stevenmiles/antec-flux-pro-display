@@ -25,13 +25,32 @@ impl NvidiaGpu {
     }
 }
 
+pub struct AmdGpu {
+    device_path: String,
+}
+
+impl AmdGpu {
+    pub fn new(device_path: String) -> Self {
+        Self { device_path }
+    }
+
+    pub fn temp(&self) -> Option<f32> {
+        crate::cpu::read_temp(&self.device_path)
+    }
+}
+
 pub enum AvailableGpu {
     Nvidia(Box<NvidiaGpu>),
+    Amd(AmdGpu),
     Unknown,
 }
 
 impl AvailableGpu {
-    pub fn get_available_gpu() -> AvailableGpu {
+    pub fn get_available_gpu(gpu_device: Option<&str>) -> AvailableGpu {
+        if let Some(path) = gpu_device {
+            return AvailableGpu::Amd(AmdGpu::new(path.to_string()));
+        }
+
         let maybe_nvidia =
             try_get_nvidia_gpu().inspect_err(|e| eprintln!("Failed to get Nvidia GPU. Error: {e}"));
 
@@ -39,12 +58,16 @@ impl AvailableGpu {
             return gpu;
         }
 
+        eprintln!(
+            "No gpu_device configured and no NVIDIA GPU found. Set gpu_device in config.toml to an AMD hwmon temp path (e.g. /sys/class/hwmon/hwmon2/temp2_input)."
+        );
         AvailableGpu::Unknown
     }
 
     pub fn temp(&self) -> Option<f32> {
         match self {
             AvailableGpu::Nvidia(gpu) => gpu.temp(),
+            AvailableGpu::Amd(gpu) => gpu.temp(),
             AvailableGpu::Unknown => None,
         }
     }
