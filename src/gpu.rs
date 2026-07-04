@@ -1,8 +1,4 @@
 use anyhow::{Context, Result};
-use libamdgpu_top::{
-    AMDGPU::{GpuMetrics, MetricsInfo},
-    DevicePath,
-};
 use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor};
 
 pub struct NvidiaGpu {
@@ -30,20 +26,16 @@ impl NvidiaGpu {
 }
 
 pub struct AmdGpu {
-    device_path: DevicePath,
+    device_path: String,
 }
 
 impl AmdGpu {
-    pub fn new(device_path: DevicePath) -> Self {
+    pub fn new(device_path: String) -> Self {
         Self { device_path }
     }
 
     pub fn temp(&self) -> Option<f32> {
-        let gpu_metrics = GpuMetrics::get_from_sysfs_path(self.device_path.sysfs_path.clone())
-            .inspect_err(|e| eprintln!("Error getting AMD GPU metrics: {:?}", e))
-            .ok()?;
-        let temperature: Option<Vec<u16>> = gpu_metrics.get_average_temperature_core();
-        temperature.map(|temp| temp[0] as f32 / 100.0)
+        crate::cpu::read_temp(&self.device_path)
     }
 }
 
@@ -54,7 +46,11 @@ pub enum AvailableGpu {
 }
 
 impl AvailableGpu {
-    pub fn get_available_gpu() -> AvailableGpu {
+    pub fn get_available_gpu(gpu_device: Option<&str>) -> AvailableGpu {
+        if let Some(path) = gpu_device {
+            return AvailableGpu::Amd(AmdGpu::new(path.to_string()));
+        }
+
         let maybe_nvidia =
             try_get_nvidia_gpu().inspect_err(|e| eprintln!("Failed to get Nvidia GPU. Error: {e}"));
 
@@ -62,13 +58,9 @@ impl AvailableGpu {
             return gpu;
         }
 
-        let maybe_amd =
-            try_get_amdgpu_gpu().inspect_err(|e| eprintln!("Failed to get AMD GPU. Error: {}", e));
-
-        if let Ok(gpu) = maybe_amd {
-            return gpu;
-        }
-
+        eprintln!(
+            "No gpu_device configured and no NVIDIA GPU found. Set gpu_device in config.toml to an AMD hwmon temp path (e.g. /sys/class/hwmon/hwmon2/temp2_input)."
+        );
         AvailableGpu::Unknown
     }
 
@@ -98,15 +90,4 @@ fn try_get_nvidia_gpu() -> Result<AvailableGpu> {
 
     println!("Found {device_count} NVML-supported GPUs");
     Ok(AvailableGpu::Nvidia(Box::new(NvidiaGpu::new(nvml))))
-}
-
-fn try_get_amdgpu_gpu() -> Result<AvailableGpu> {
-    let device_path = DevicePath::get_device_path_list();
-
-    if device_path.is_empty() {
-        return Err(anyhow::anyhow!("No AMD GPU devices found"));
-    }
-
-    println!("Found {} AMD GPU devices", device_path.len());
-    Ok(AvailableGpu::Amd(AmdGpu::new(device_path[0].clone())))
 }
