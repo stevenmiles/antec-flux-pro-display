@@ -60,7 +60,7 @@ impl AvailableGpu {
         }
 
         eprintln!(
-            "No gpu_device configured and no NVIDIA GPU found. Set gpu_device in config.toml to an AMD hwmon temp path (e.g. /sys/class/hwmon/hwmon2/temp2_input)."
+            "No GPU temp sensor found: no gpu_device in config, no NVIDIA GPU, and no amdgpu hwmon node with a junction/edge sensor. Set gpu_device in config.toml to override (e.g. /sys/class/hwmon/hwmon2/temp2_input)."
         );
         AvailableGpu::Unknown
     }
@@ -74,11 +74,26 @@ impl AvailableGpu {
     }
 }
 
-/// Finds the `amdgpu` hwmon junction temp path by driver name and sensor
-/// label rather than a hardcoded hwmon index, since hwmon numbering shifts
-/// across reboots/kernel updates. Systems with an iGPU also expose a second
-/// `amdgpu` hwmon node; the label check skips it since it has no junction sensor.
+/// Finds an `amdgpu` hwmon temp path by driver name and sensor label rather
+/// than a hardcoded hwmon index, since hwmon numbering shifts across
+/// reboots/kernel updates.
+///
+/// Prefers a `junction` sensor: it's present on discrete AMD GPUs but absent
+/// on iGPUs, so it disambiguates the two on systems that expose both. Falls
+/// back to `edge` for GPUs/APUs that don't report junction. The junction pass
+/// runs across all nodes before the edge pass so a discrete card always wins
+/// over an iGPU's edge sensor.
 pub fn default_gpu_device() -> Option<String> {
+    for label in ["junction", "edge"] {
+        if let Some(device) = find_amdgpu_temp(label) {
+            return Some(device);
+        }
+    }
+
+    None
+}
+
+fn find_amdgpu_temp(label: &str) -> Option<String> {
     let entries = fs::read_dir("/sys/class/hwmon").ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -90,14 +105,15 @@ pub fn default_gpu_device() -> Option<String> {
         }
 
         for n in 1..=3 {
-            let label = fs::read_to_string(path.join(format!("temp{n}_label")));
-            if label.is_ok_and(|l| l.trim() == "junction") {
+            let found = fs::read_to_string(path.join(format!("temp{n}_label")))
+                .is_ok_and(|l| l.trim() == label);
+            if found {
                 let device = path
                     .join(format!("temp{n}_input"))
                     .to_string_lossy()
                     .into_owned();
                 println!(
-                    "Detected AMD GPU temp sensor: {device} ({}, label: junction)",
+                    "Detected AMD GPU temp sensor: {device} ({}, label: {label})",
                     path.display()
                 );
                 return Some(device);
