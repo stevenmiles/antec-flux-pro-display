@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor};
+use std::fs;
 
 pub struct NvidiaGpu {
     nvml: Nvml,
@@ -71,6 +72,36 @@ impl AvailableGpu {
             AvailableGpu::Unknown => None,
         }
     }
+}
+
+/// Finds the `amdgpu` hwmon junction temp path by driver name and sensor
+/// label rather than a hardcoded hwmon index, since hwmon numbering shifts
+/// across reboots/kernel updates. Systems with an iGPU also expose a second
+/// `amdgpu` hwmon node; the label check skips it since it has no junction sensor.
+pub fn default_gpu_device() -> Option<String> {
+    let entries = fs::read_dir("/sys/class/hwmon").ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(name) = fs::read_to_string(path.join("name")) else {
+            continue;
+        };
+        if name.trim() != "amdgpu" {
+            continue;
+        }
+
+        for n in 1..=3 {
+            let label = fs::read_to_string(path.join(format!("temp{n}_label")));
+            if label.is_ok_and(|l| l.trim() == "junction") {
+                return Some(
+                    path.join(format!("temp{n}_input"))
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+
+    None
 }
 
 fn try_get_nvidia_gpu() -> Result<AvailableGpu> {

@@ -12,7 +12,7 @@ use clap::Parser;
 
 use config::{Config, FromConfigFile};
 use cpu::default_cpu_device;
-use gpu::AvailableGpu;
+use gpu::{AvailableGpu, default_gpu_device};
 use usb::UsbDevice;
 
 #[derive(clap::Parser)]
@@ -41,7 +41,8 @@ fn main() -> Result<()> {
     let config = Config::from_config_file(&config_path)?;
     let device = UsbDevice::open(usb::VENDOR_ID, usb::PRODUCT_ID)?;
     let cpu = config.cpu_device.clone().or_else(default_cpu_device);
-    let gpu = AvailableGpu::get_available_gpu(config.gpu_device.as_deref());
+    let gpu_device = config.gpu_device.clone().or_else(default_gpu_device);
+    let gpu = AvailableGpu::get_available_gpu(gpu_device.as_deref());
 
     // Handle CTRL+C and other termination gracefully
     let run = running.clone();
