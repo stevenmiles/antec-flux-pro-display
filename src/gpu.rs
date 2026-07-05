@@ -92,11 +92,15 @@ pub fn default_gpu_device() -> Option<String> {
         for n in 1..=3 {
             let label = fs::read_to_string(path.join(format!("temp{n}_label")));
             if label.is_ok_and(|l| l.trim() == "junction") {
-                return Some(
-                    path.join(format!("temp{n}_input"))
-                        .to_string_lossy()
-                        .into_owned(),
+                let device = path
+                    .join(format!("temp{n}_input"))
+                    .to_string_lossy()
+                    .into_owned();
+                println!(
+                    "Detected AMD GPU temp sensor: {device} ({}, label: junction)",
+                    path.display()
                 );
+                return Some(device);
             }
         }
     }
