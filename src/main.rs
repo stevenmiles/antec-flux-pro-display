@@ -40,8 +40,20 @@ fn main() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let config = Config::from_config_file(&config_path)?;
     let device = UsbDevice::open(usb::VENDOR_ID, usb::PRODUCT_ID)?;
-    let cpu = config.cpu_device.clone().or_else(default_cpu_device);
-    let gpu_device = config.gpu_device.clone().or_else(default_gpu_device);
+    let cpu = match config.cpu_device.clone() {
+        Some(path) => {
+            println!("Using CPU temp sensor from config: {path}");
+            Some(path)
+        }
+        None => default_cpu_device(),
+    };
+    let gpu_device = match config.gpu_device.clone() {
+        Some(path) => {
+            println!("Using GPU temp sensor from config: {path}");
+            Some(path)
+        }
+        None => default_gpu_device(),
+    };
     let gpu = AvailableGpu::get_available_gpu(gpu_device.as_deref());
 
     // Handle CTRL+C and other termination gracefully
