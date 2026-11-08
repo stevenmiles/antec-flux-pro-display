@@ -1,116 +1,144 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 pub const VENDOR_ID: u16 = 0x2022;
 pub const PRODUCT_ID: u16 = 0x0522;
 
+const INTERFACE: u8 = 0;
+
+/// The display acknowledges a write in a couple of milliseconds, so this only
+/// ever expires when the device is not really there.
+///
+/// Keep it short. A transfer that times out has to be cancelled, and cancelling
+/// makes the kernel send a Stop Endpoint command to the host controller. If the
+/// device's port has not come back from suspend yet, the controller never
+/// answers that command and the kernel declares the whole controller dead
+/// ("xHCI host controller not responding, assume dead"), which takes down every
+/// other device on it until the machine is rebooted.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The endpoint the display listens on, resolved once when we open the device
+/// rather than re-walking the descriptors on every write.
+struct Endpoint {
+    address: u8,
+    transfer_type: rusb::TransferType,
+}
+
 pub struct UsbDevice {
     handle: rusb::DeviceHandle<rusb::GlobalContext>,
+    endpoint: Endpoint,
 }
 
 impl UsbDevice {
     pub fn open(vendor_id: u16, product_id: u16) -> Result<Self> {
-        match rusb::open_device_with_vid_pid(vendor_id, product_id) {
-            Some(handle) => {
-                // Detach the kernel driver if it is attached
-                if handle.kernel_driver_active(0).unwrap_or(false) {
-                    handle.detach_kernel_driver(0).unwrap_or(());
-                }
-                // Claim the interface so we can communicate with the device
-                // This is necessary to access the device and avoid IO errors
-                handle.claim_interface(0).unwrap_or_else(|e| {
-                    eprintln!("Error claiming interface: {e:?}");
-                    std::process::exit(1);
-                });
-                Ok(Self { handle })
-            }
-            None => {
-                // Check if device is visible at all
-                let devices = match rusb::devices() {
-                    Ok(devices) => devices,
-                    Err(e) => {
-                        eprintln!("Error getting devices: {e}");
-                        std::process::exit(1);
-                    }
-                };
+        let Some(handle) = rusb::open_device_with_vid_pid(vendor_id, product_id) else {
+            return Err(describe_missing_device(vendor_id, product_id));
+        };
 
-                for device in devices.iter() {
-                    let device_desc = match device.device_descriptor() {
-                        Ok(desc) => desc,
-                        Err(e) => {
-                            eprintln!("Error getting device descriptor: {e}");
-                            std::process::exit(1);
-                        }
-                    };
+        // usbhid binds this interface, so hand it over for as long as we hold
+        // the handle. Auto-detach re-attaches the kernel driver when the handle
+        // is released, so dropping us leaves the device in a usable state.
+        handle
+            .set_auto_detach_kernel_driver(true)
+            .map_err(|e| anyhow!("could not detach the kernel driver: {e}"))?;
+        handle
+            .claim_interface(INTERFACE)
+            .map_err(|e| anyhow!("could not claim interface {INTERFACE}: {e}"))?;
 
-                    if device_desc.vendor_id() == VENDOR_ID
-                        && device_desc.product_id() == PRODUCT_ID
-                    {
-                        eprintln!("Permission denied accessing USB device.");
-                        eprintln!("Please ensure udev rules are properly configured.");
-                        std::process::exit(1);
-                    }
-                }
-                eprintln!("USB device not found. Is it connected?");
-                eprintln!("Looking for device {VENDOR_ID:04x}:{PRODUCT_ID:04x}");
-                std::process::exit(1);
-            }
-        }
+        let endpoint = resolve_out_endpoint(&handle)?;
+        Ok(Self { handle, endpoint })
     }
 
-    pub fn send_payload(&self, cpu_temp: &Option<f32>, gpu_temp: &Option<f32>) {
+    /// Write the temperatures to the display.
+    ///
+    /// Returns the underlying USB error rather than exiting, so that a device
+    /// that has gone away - across a suspend/resume, say - can be dealt with by
+    /// dropping this handle and opening a fresh one.
+    pub fn send_payload(&self, cpu_temp: &Option<f32>, gpu_temp: &Option<f32>) -> rusb::Result<()> {
         let payload = generate_payload(cpu_temp, gpu_temp);
 
-        let config_desc = match self.handle.device().config_descriptor(0) {
-            Ok(desc) => desc,
-            Err(e) => {
-                eprintln!("Error getting config descriptor: {e}");
-                std::process::exit(1);
+        let written = match self.endpoint.transfer_type {
+            rusb::TransferType::Bulk => {
+                self.handle
+                    .write_bulk(self.endpoint.address, &payload, WRITE_TIMEOUT)?
             }
+            // Both of the display's endpoints are interrupt endpoints.
+            _ => self
+                .handle
+                .write_interrupt(self.endpoint.address, &payload, WRITE_TIMEOUT)?,
         };
-        // Find the first bulk OUT endpoint
-        let endpoint_address = config_desc
-            .interfaces()
-            .flat_map(|interface| interface.descriptors())
-            .flat_map(|desc| desc.endpoint_descriptors())
-            .find(|endpoint| {
-                endpoint.transfer_type() == rusb::TransferType::Interrupt
-                    && endpoint.direction() == rusb::Direction::Out
-            })
-            .map(|endpoint| endpoint.address())
-            // This appears to be the correct endpoint on my machine
-            // Seems reasonable as the default
-            .unwrap_or(0x03);
 
-        // Detach the kernel driver if it is attached
-        if self.handle.kernel_driver_active(0).unwrap_or(false) {
-            self.handle.detach_kernel_driver(0).unwrap_or_else(|e| {
-                eprintln!("Error detaching kernel driver: {e}");
-                std::process::exit(1);
-            });
+        if written != payload.len() {
+            return Err(rusb::Error::Io);
         }
-        self.handle.release_interface(0).unwrap_or_else(|e| {
-            eprintln!("Error releasing interface: {e}");
-            std::process::exit(1);
-        });
-        // Claim the interface so we can communicate with the device
-        // This is necessary to access the device and avoid IO errors
-        self.handle.claim_interface(0).unwrap_or_else(|e| {
-            eprintln!("Error claiming interface: {e:?}");
-            std::process::exit(1);
+        Ok(())
+    }
+}
+
+/// Prefer the interrupt OUT endpoint, which is what this display exposes, but
+/// accept a bulk one so a revised device still works.
+fn resolve_out_endpoint(handle: &rusb::DeviceHandle<rusb::GlobalContext>) -> Result<Endpoint> {
+    let config_desc = handle
+        .device()
+        .config_descriptor(0)
+        .map_err(|e| anyhow!("could not read the device's config descriptor: {e}"))?;
+
+    let candidates: Vec<Endpoint> = config_desc
+        .interfaces()
+        .flat_map(|interface| interface.descriptors())
+        .flat_map(|desc| desc.endpoint_descriptors())
+        .filter(|endpoint| endpoint.direction() == rusb::Direction::Out)
+        .filter(|endpoint| {
+            matches!(
+                endpoint.transfer_type(),
+                rusb::TransferType::Interrupt | rusb::TransferType::Bulk
+            )
+        })
+        .map(|endpoint| Endpoint {
+            address: endpoint.address(),
+            transfer_type: endpoint.transfer_type(),
+        })
+        .collect();
+
+    let endpoint = candidates
+        .iter()
+        .find(|endpoint| endpoint.transfer_type == rusb::TransferType::Interrupt)
+        .or_else(|| candidates.first())
+        .map(|endpoint| Endpoint {
+            address: endpoint.address,
+            transfer_type: endpoint.transfer_type,
+        })
+        // The interrupt OUT endpoint on every unit seen so far.
+        .unwrap_or(Endpoint {
+            address: 0x03,
+            transfer_type: rusb::TransferType::Interrupt,
         });
 
-        match self
-            .handle
-            .write_bulk(endpoint_address, &payload, Duration::from_millis(1000))
-        {
-            Ok(_) => (),
-            Err(e) => {
-                eprintln!("Error writing bulk: {e:?}");
-                std::process::exit(1);
-            }
-        }
+    Ok(endpoint)
+}
+
+/// Work out why `open_device_with_vid_pid` came back empty, so the user gets
+/// told about a udev problem rather than an unplugged cable.
+fn describe_missing_device(vendor_id: u16, product_id: u16) -> anyhow::Error {
+    let devices = match rusb::devices() {
+        Ok(devices) => devices,
+        Err(e) => return anyhow!("could not enumerate USB devices: {e}"),
+    };
+
+    let visible = devices.iter().any(|device| {
+        device
+            .device_descriptor()
+            .is_ok_and(|desc| desc.vendor_id() == vendor_id && desc.product_id() == product_id)
+    });
+
+    if visible {
+        anyhow!(
+            "permission denied accessing USB device {vendor_id:04x}:{product_id:04x}. \
+             Please ensure udev rules are properly configured."
+        )
+    } else {
+        anyhow!("USB device {vendor_id:04x}:{product_id:04x} not found. Is it connected?")
     }
 }
 
