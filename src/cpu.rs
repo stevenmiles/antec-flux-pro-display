@@ -26,7 +26,9 @@ pub fn default_cpu_device() -> Option<String> {
     }
 
     if fs::read_to_string("/sys/class/thermal/thermal_zone0/temp").is_ok() {
-        println!("Detected CPU temp sensor: /sys/class/thermal/thermal_zone0/temp (thermal_zone0 fallback)");
+        println!(
+            "Detected CPU temp sensor: /sys/class/thermal/thermal_zone0/temp (thermal_zone0 fallback)"
+        );
         return Some("/sys/class/thermal/thermal_zone0/temp".to_string());
     }
 
